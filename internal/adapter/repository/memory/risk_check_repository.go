@@ -143,6 +143,21 @@ func (r *RiskCheckServiceMemory) CheckDeviceFingerprint(ctx context.Context, use
 
 	// 这里使用 UniqueFlag 作为设备指纹的简化实现
 	// 实际项目中应该从请求上下文中获取真实的设备指纹信息
+	
+	// 如果 detail 为 nil，说明还在任务完成前的风控检查阶段
+	// 此时可以从上下文中获取设备指纹，或者跳过设备指纹检查
+	// 这里采用跳过检查的方式，因为设备指纹通常在任务完成时才记录
+	if detail == nil {
+		// 仅检查用户历史设备数量
+		if devices, exists := r.userDevices[userID]; exists {
+			deviceCount := len(devices)
+			if deviceCount > 10 {
+				return fmt.Errorf("设备指纹异常: 用户使用设备过多(%d个设备)", deviceCount)
+			}
+		}
+		return nil
+	}
+
 	deviceID := detail.UniqueFlag
 	if deviceID == "" {
 		return nil

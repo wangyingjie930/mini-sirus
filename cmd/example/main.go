@@ -61,19 +61,20 @@ func NewContainer() *Container {
 	reachAdapter := notification.NewReachAdapter()
 	riskCheckService := memory.NewRiskCheckServiceMemory()
 
-	// 注册观察者
+	// 注册观察者（仅注册适合异步执行的观察者）
+	// 风控服务不应该作为观察者，而应该在用例层同步执行
 	checkinObserver := observer.NewCheckinReachObserver(reachAdapter)
-	riskCheckObserver := observer.NewRiskCheckObserver(riskCheckService)
 	observerRegistry.Register(checkinObserver)
-	observerRegistry.Register(riskCheckObserver)
 
 	// 用例层
+	// 风控服务作为依赖注入到 TriggerTaskUseCase
 	triggerTaskUC := task.NewTriggerTaskUseCase(
 		taskRepo,
 		taskDetailRepo,
 		ruleEngine,
 		observerRegistry,
 		distributedLock,
+		riskCheckService, // 风控服务作为依赖注入，在任务完成前同步执行
 	)
 	createTaskUC := task.NewCreateTaskUseCase(taskRepo)
 	queryTaskUC := task.NewQueryTaskUseCase(taskRepo)
@@ -96,7 +97,7 @@ func NewContainer() *Container {
 }
 
 func main() {
-	fmt.Println("=== Mini-Sirus Clean Architecture Example ===\n")
+	fmt.Println("=== Mini-Sirus Clean Architecture Example ===")
 
 	// 初始化容器
 	container := NewContainer()

@@ -2,7 +2,7 @@
 
 ## 概述
 
-本项目实现了一个完整的风控检查系统，用于监控和防范用户的异常行为。风控系统作为任务系统的观察者（Observer），在任务完成时自动触发风控检查。
+本项目实现了一个完整的风控检查系统，用于监控和防范用户的异常行为。风控系统作为**用例层的同步依赖**，在任务完成**之前**执行风控检查，确保只有通过风控的任务才能被保存和奖励。
 
 ## 架构设计
 
@@ -11,6 +11,9 @@
 ```
 用例层 (UseCase)
     ↓
+    ├─ 风控服务 (同步依赖，阻塞任务完成)
+    └─ 观察者 (异步通知，非阻塞操作)
+    ↓
 输出端口 (Output Port)
     ↓
 适配器层 (Adapter)
@@ -18,7 +21,76 @@
 仓储实现 (Repository)
 ```
 
-### 2. 核心组件
+### 2. 风控服务的正确使用方式
+
+#### ❌ 错误的做法：作为观察者
+
+```go
+// 错误：风控作为观察者，在任务已完成后异步执行
+type RiskCheckObserver struct {
+    riskCheckService output.RiskCheckService
+}
+
+func (o *RiskCheckObserver) OnTaskDetailCreated(ctx context.Context, detail *entity.ActUserTaskDetail) error {
+    // 此时任务已经保存，即使风控失败也无法回滚
+    return o.riskCheckService.Check(ctx, detail.UserID)
+}
+```
+
+**问题**：
+- 任务已经入库，风控失败无法阻止
+- 奖励可能已经发放，事后补救成本高
+- 违反业务逻辑：应该先检查，再完成
+
+#### ✅ 正确的做法：作为用例依赖
+
+```go
+// 正确：风控服务作为用例的依赖注入
+type TriggerTaskUseCase struct {
+    riskCheckService output.RiskCheckService // 依赖注入
+}
+
+func (uc *TriggerTaskUseCase) processTask(ctx context.Context, task *entity.ActUserTask) error {
+    // 1. 先执行风控检查（同步阻塞）
+    if err := uc.performRiskCheck(ctx, task.UserID, task.ID); err != nil {
+        return fmt.Errorf("风控检查失败: %w", err)
+    }
+    
+    // 2. 风控通过后才创建任务明细
+    detail := &entity.ActUserTaskDetail{...}
+    
+    // 3. 保存任务
+    if err := uc.taskDetailRepo.Create(ctx, detail); err != nil {
+        return err
+    }
+    
+    // 4. 通知观察者（触达、统计等非阻塞操作）
+    uc.observerRegistry.Notify(ctx, detail)
+    
+    return nil
+}
+```
+
+**优势**：
+- 风控检查在任务完成前执行，可以阻止恶意行为
+- 失败时不产生脏数据
+- 符合业务逻辑顺序
+
+### 3. 观察者模式的正确使用
+
+观察者模式适用于：
+- ✅ 触达通知（推送消息）
+- ✅ 异步统计（用户行为分析）
+- ✅ 日志记录
+- ✅ 积分发放（可补偿）
+
+观察者模式**不适用**于：
+- ❌ 风控检查（必须阻塞）
+- ❌ 权限验证（必须阻塞）
+- ❌ 余额扣减（不可补偿）
+- ❌ 任何需要阻止业务流程的操作
+
+### 3. 核心组件
 
 #### 2.1 输出端口接口
 
@@ -54,17 +126,79 @@
 - 单用户使用设备数量限制（≤ 10个）
 - 双向映射关系维护
 
-#### 2.3 风控观察者
+#### 2.3 风控检查流程
+
+**文件**: `internal/usecase/task/trigger_task.go`
+
+在 `TriggerTaskUseCase` 中，风控检查在任务明细创建**之前**同步执行：
+
+```go
+// processTask 处理单个任务
+func (uc *TriggerTaskUseCase) processTask(ctx context.Context, task *entity.ActUserTask) error {
+    // 1. 执行规则引擎判定
+    reach, err := uc.ruleEngine.Evaluate(...)
+    if !reach {
+        return nil
+    }
+
+    // 2. 风控检查（同步执行，阻塞任务完成）⭐ 关键步骤
+    if err := uc.performRiskCheck(ctx, task.UserID, task.ID); err != nil {
+        return fmt.Errorf("风控检查失败: %w", err)
+    }
+
+    // 3. 风控通过后，才创建任务明细
+    detail := &entity.ActUserTaskDetail{...}
+    if err := uc.taskDetailRepo.Create(ctx, detail); err != nil {
+        return err
+    }
+
+    // 4. 更新任务进度
+    task.UpdateProgress()
+    uc.taskRepo.Update(ctx, task)
+
+    // 5. 记录任务完成事件（用于风控统计）
+    uc.riskCheckService.RecordTaskCompletion(ctx, task.UserID, task.ID, detail.CreatedAt)
+
+    // 6. 通知观察者（触达服务、统计服务等非阻塞操作）
+    uc.observerRegistry.Notify(ctx, detail)
+
+    return nil
+}
+
+// performRiskCheck 执行风控检查（同步阻塞）
+func (uc *TriggerTaskUseCase) performRiskCheck(ctx context.Context, userID, taskID int64) error {
+    // 检查黑名单
+    if isBlacklisted, _ := uc.riskCheckService.IsUserBlacklisted(ctx, userID); isBlacklisted {
+        return fmt.Errorf("用户已被列入黑名单")
+    }
+
+    // 检查用户行为
+    if err := uc.riskCheckService.CheckUserBehavior(ctx, userID, nil); err != nil {
+        _ = uc.riskCheckService.AddToBlacklist(ctx, userID, "用户行为异常")
+        return err
+    }
+
+    // 检查任务频率
+    if err := uc.riskCheckService.CheckTaskFrequency(ctx, userID, taskID); err != nil {
+        _ = uc.riskCheckService.AddToBlacklist(ctx, userID, "任务完成频率过高")
+        return err
+    }
+
+    // 检查设备指纹
+    if err := uc.riskCheckService.CheckDeviceFingerprint(ctx, userID, nil); err != nil {
+        _ = uc.riskCheckService.AddToBlacklist(ctx, userID, "设备指纹异常")
+        return err
+    }
+
+    return nil
+}
+```
+
+#### 2.4 触达服务（观察者模式）
 
 **文件**: `internal/adapter/observer/task_observers.go`
 
-风控检查观察者 `RiskCheckObserver`，在任务明细创建时自动执行风控检查：
-
-1. 检查用户是否在黑名单
-2. 检查用户行为异常
-3. 检查任务完成频率
-4. 检查设备指纹
-5. 记录任务完成事件
+触达服务适合作为观察者，因为它是**非阻塞**的通知操作：
 
 ## 风控规则详解
 
@@ -184,27 +318,46 @@ type TaskCompletionRecord struct {
 
 ## 使用示例
 
-### 1. 初始化风控服务
+### 1. 初始化风控服务（依赖注入）
 
 ```go
 // 创建风控服务
 riskCheckService := memory.NewRiskCheckServiceMemory()
 
-// 创建风控观察者
-riskCheckObserver := observer.NewRiskCheckObserver(riskCheckService)
+// 将风控服务注入到用例中（不是观察者！）
+triggerTaskUC := task.NewTriggerTaskUseCase(
+    taskRepo,
+    taskDetailRepo,
+    ruleEngine,
+    observerRegistry,
+    distributedLock,
+    riskCheckService, // 作为依赖注入
+)
 
-// 注册观察者
-observerRegistry.Register(riskCheckObserver)
+// 注册观察者（仅注册适合异步执行的观察者）
+checkinObserver := observer.NewCheckinReachObserver(reachAdapter)
+observerRegistry.Register(checkinObserver)
+// 注意：不再注册 RiskCheckObserver
 ```
 
 ### 2. 自动触发
 
-风控检查会在任务完成时自动触发，无需手动调用：
+风控检查会在任务完成**之前**自动执行，失败时会阻止任务完成：
 
 ```go
 // 触发任务
-container.TriggerTaskUC.Execute(ctx, triggerInput)
-// → 任务完成 → 观察者通知 → 风控检查自动执行
+err := container.TriggerTaskUC.Execute(ctx, triggerInput)
+// 执行流程：
+// 1. 规则引擎判定 → 
+// 2. 风控检查（同步阻塞）→ 
+// 3. 创建任务明细 → 
+// 4. 更新进度 → 
+// 5. 通知观察者（异步）
+
+if err != nil {
+    // 风控失败，任务未完成，没有产生脏数据
+    log.Printf("任务触发失败: %v", err)
+}
 ```
 
 ### 3. 手动检查
@@ -224,15 +377,17 @@ err := riskCheckService.CheckTaskFrequency(ctx, userID, taskID)
 项目提供了完整的风控测试用例（`cmd/example/main.go`）：
 
 1. **测试1**: 正常签到 - 验证正常用户可以通过风控检查
-2. **测试2**: 频繁签到 - 模拟1分钟内12次签到，触发风控拦截
+2. **测试2**: 频繁签到 - 模拟1分钟内12次签到，**风控会在任务保存前拦截**
 3. **测试3**: 黑名单检查 - 验证用户被加入黑名单
-4. **测试4**: 黑名单用户尝试操作 - 验证黑名单用户被拒绝
+4. **测试4**: 黑名单用户尝试操作 - 验证黑名单用户**在任务创建前被拒绝**
 
 运行测试：
 
 ```bash
 go run cmd/example/main.go
 ```
+
+**重要**：新架构下，风控失败的任务**不会被创建**，不会产生脏数据。
 
 ## 扩展建议
 
@@ -294,11 +449,19 @@ rules:
 本风控系统实现了：
 
 ✅ 完整的分层架构（端口-适配器模式）  
-✅ 观察者模式集成  
+✅ **风控服务作为用例依赖**（同步阻塞，在任务完成前执行）  
+✅ 观察者模式用于非阻塞操作（触达、统计等）  
 ✅ 多维度风控检测  
 ✅ 黑名单机制  
 ✅ 内存存储实现  
 ✅ 完整的测试用例  
+
+### 关键设计原则
+
+1. **风控必须同步**：在任务完成前执行，失败可阻止任务创建
+2. **观察者用于通知**：用于触达、统计等不影响业务流程的操作
+3. **职责分离清晰**：阻塞操作在用例层，非阻塞操作用观察者
+4. **无脏数据产生**：风控失败时，任务不会入库
 
 适用于中小型项目的风控需求，可根据实际业务场景进行扩展和优化。
 

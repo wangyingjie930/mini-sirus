@@ -32,20 +32,22 @@ func main() {
 	memLock := infrastructure.NewMemoryLock()
 	distributedLock := infrastructure.NewDistributedLockAdapter(memLock)
 	reachAdapter := notification.NewReachAdapter()
+	riskCheckService := memory.NewRiskCheckServiceMemory()
 
-	// 注册观察者
+	// 注册观察者（仅注册适合异步执行的观察者）
+	// 风控服务不应该作为观察者，而应该在用例层同步执行
 	checkinObserver := observer.NewCheckinReachObserver(reachAdapter)
-	riskCheckObserver := observer.NewRiskCheckObserver()
 	observerRegistry.Register(checkinObserver)
-	observerRegistry.Register(riskCheckObserver)
 
 	// 初始化用例层
+	// 风控服务作为依赖注入到 TriggerTaskUseCase
 	triggerTaskUC := task.NewTriggerTaskUseCase(
 		taskRepo,
 		taskDetailRepo,
 		ruleEngine,
 		observerRegistry,
 		distributedLock,
+		riskCheckService, // 风控服务作为依赖注入，在任务完成前同步执行
 	)
 	createTaskUC := task.NewCreateTaskUseCase(taskRepo)
 	queryTaskUC := task.NewQueryTaskUseCase(taskRepo)
