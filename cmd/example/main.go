@@ -30,6 +30,7 @@ type Container struct {
 	ObserverRegistry *observer.TaskObserverRegistry
 	DistributedLock  *infrastructure.DistributedLockAdapter
 	ReachAdapter     *notification.ReachAdapter
+	RiskCheckService *memory.RiskCheckServiceMemory
 
 	// Use Cases
 	TriggerTaskUC *task.TriggerTaskUseCase
@@ -58,10 +59,11 @@ func NewContainer() *Container {
 	memLock := infrastructure.NewMemoryLock()
 	distributedLock := infrastructure.NewDistributedLockAdapter(memLock)
 	reachAdapter := notification.NewReachAdapter()
+	riskCheckService := memory.NewRiskCheckServiceMemory()
 
 	// 注册观察者
 	checkinObserver := observer.NewCheckinReachObserver(reachAdapter)
-	riskCheckObserver := observer.NewRiskCheckObserver()
+	riskCheckObserver := observer.NewRiskCheckObserver(riskCheckService)
 	observerRegistry.Register(checkinObserver)
 	observerRegistry.Register(riskCheckObserver)
 
@@ -84,6 +86,7 @@ func NewContainer() *Container {
 		ObserverRegistry: observerRegistry,
 		DistributedLock:  distributedLock,
 		ReachAdapter:     reachAdapter,
+		RiskCheckService: riskCheckService,
 		TriggerTaskUC:    triggerTaskUC,
 		CreateTaskUC:     createTaskUC,
 		QueryTaskUC:      queryTaskUC,
@@ -203,5 +206,114 @@ func main() {
 
 	fmt.Println("\n=== Example execution completed ===")
 	container.Logger.Info("Application finished successfully")
+
+	// 示例7: 风控测试 - 模拟频繁操作
+	fmt.Println("\n--- Example 7: Risk Control Test ---")
+	testRiskControl(ctx, container)
+}
+
+// testRiskControl 测试风控功能
+func testRiskControl(ctx context.Context, container *Container) {
+	// 创建测试用户的签到任务
+	fmt.Println("创建测试用户(999)的签到任务...")
+	testCreateInput := dto.CreateTaskInput{
+		ActivityID:   3,
+		TaskID:       300,
+		UserID:       999,
+		Target:       1,
+		TaskType:     valueobject.TaskTypeCheckin,
+		TaskCondExpr: "IS_TODAY()",
+	}
+
+	testTask, err := container.CreateTaskUC.Execute(ctx, testCreateInput)
+	if err != nil {
+		log.Printf("创建测试任务失败: %v", err)
+		return
+	}
+	fmt.Printf("测试任务创建成功: ID=%d\n\n", testTask.ID)
+
+	// 测试1: 正常签到
+	fmt.Println("测试1: 正常签到...")
+	normalCheckin := &dto.CheckinEventDTO{
+		UserID: 999,
+		Date:   time.Now().Format("2006-01-02"),
+	}
+	triggerInput := dto.TriggerTaskInput{
+		TaskMode: normalCheckin,
+	}
+
+	if err := container.TriggerTaskUC.Execute(ctx, triggerInput); err != nil {
+		log.Printf("❌ 正常签到失败: %v", err)
+	} else {
+		fmt.Println("✅ 正常签到成功，风控检查通过")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// 测试2: 模拟短时间内频繁签到（触发风控）
+	fmt.Println("\n测试2: 模拟短时间内频繁签到...")
+	for i := 0; i < 12; i++ {
+		// 重新创建任务（因为之前的已完成）
+		testCreateInput.TaskID = int64(300 + i + 1)
+		_, err := container.CreateTaskUC.Execute(ctx, testCreateInput)
+		if err != nil {
+			continue
+		}
+
+		checkinEvent := &dto.CheckinEventDTO{
+			UserID: 999,
+			Date:   time.Now().Format("2006-01-02"),
+		}
+		triggerInput := dto.TriggerTaskInput{
+			TaskMode: checkinEvent,
+		}
+
+		if err := container.TriggerTaskUC.Execute(ctx, triggerInput); err != nil {
+			fmt.Printf("❌ 第%d次签到被风控拦截: %v\n", i+1, err)
+			break
+		} else {
+			fmt.Printf("✅ 第%d次签到成功\n", i+1)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 测试3: 检查用户是否被加入黑名单
+	fmt.Println("\n测试3: 检查用户是否被加入黑名单...")
+	isBlacklisted, err := container.RiskCheckService.IsUserBlacklisted(ctx, 999)
+	if err != nil {
+		log.Printf("检查黑名单失败: %v", err)
+	} else if isBlacklisted {
+		fmt.Println("⚠️  用户999已被加入黑名单")
+	} else {
+		fmt.Println("用户999未在黑名单中")
+	}
+
+	// 测试4: 尝试黑名单用户签到
+	if isBlacklisted {
+		fmt.Println("\n测试4: 黑名单用户尝试签到...")
+		testCreateInput.TaskID = 400
+		_, err := container.CreateTaskUC.Execute(ctx, testCreateInput)
+		if err != nil {
+			log.Printf("创建任务失败: %v", err)
+			return
+		}
+
+		blacklistCheckin := &dto.CheckinEventDTO{
+			UserID: 999,
+			Date:   time.Now().Format("2006-01-02"),
+		}
+		triggerInput := dto.TriggerTaskInput{
+			TaskMode: blacklistCheckin,
+		}
+
+		if err := container.TriggerTaskUC.Execute(ctx, triggerInput); err != nil {
+			fmt.Printf("❌ 黑名单用户签到被拒绝: %v\n", err)
+		} else {
+			fmt.Println("⚠️  黑名单用户签到成功（不应该发生）")
+		}
+	}
+
+	fmt.Println("\n风控测试完成！")
 }
 
