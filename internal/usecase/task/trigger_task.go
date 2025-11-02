@@ -226,6 +226,21 @@ func (uc *TriggerTaskUseCase) processTask(
 		return nil
 	}
 
+	if uniqueFlag != "" {
+		exists, err := uc.taskDetailRepo.ExistsByUniqueFlag(ctx, uniqueFlag)
+		if err != nil {
+			// 检查唯一性失败，应返回错误
+			return fmt.Errorf("check unique flag failed: %w", err)
+		}
+		if exists {
+			// 如果已存在，说明是重复请求。
+			// 幂等处理：直接返回成功，表示“操作已成功执行”
+			uc.riskCheckService.RecordTaskCompletion(ctx, task.UserID, task.ID, time.Now())
+			fmt.Printf("[TriggerTask] Idempotency check: Task detail with unique_flag %s already exists\n", uniqueFlag)
+			return nil
+		}
+	}
+
 	fmt.Printf("[TriggerTask] Task %d reached!\n", task.ID)
 
 	// 创建任务明细

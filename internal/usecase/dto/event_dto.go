@@ -1,6 +1,7 @@
 package dto
 
 import (
+	"fmt"
 	"mini-sirus/internal/domain/valueobject"
 )
 
@@ -45,8 +46,9 @@ func (p *PublishEventDTO) GetUserID() int64 {
 
 // GetUniqueFlag 实现 TaskModeDTO 接口
 func (p *PublishEventDTO) GetUniqueFlag() string {
-	// 使用内容ID作为唯一标识
-	return ""
+	// 使用 内容ID 作为唯一标识（假设同一内容ID的发布事件只应触发一次）
+	// 注意：如果业务允许同一内容ID触发多次（如编辑后），则需要更复杂的唯一ID（如 client_request_id）
+	return fmt.Sprintf("publish:%d:%d", p.UserID, p.ContentID)
 }
 
 // GetExpressionArguments 实现 TaskModeDTO 接口
@@ -86,7 +88,8 @@ func (c *CheckinEventDTO) GetUserID() int64 {
 
 // GetUniqueFlag 实现 TaskModeDTO 接口
 func (c *CheckinEventDTO) GetUniqueFlag() string {
-	return ""
+	// 使用 用户ID + 日期 作为签到的唯一标识
+	return fmt.Sprintf("checkin:%d:%s", c.UserID, c.Date)
 }
 
 // GetExpressionArguments 实现 TaskModeDTO 接口
@@ -101,4 +104,3 @@ func (c *CheckinEventDTO) GetExpressionArguments() valueobject.ExpressionArgumen
 func (c *CheckinEventDTO) GetExpressionFunctions() []string {
 	return []string{"IS_TODAY"}
 }
-
