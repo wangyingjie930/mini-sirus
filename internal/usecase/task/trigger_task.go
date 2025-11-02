@@ -9,7 +9,6 @@ import (
 	"mini-sirus/internal/domain/valueobject"
 	"mini-sirus/internal/usecase/dto"
 	"mini-sirus/internal/usecase/port/output"
-	"strings"
 	"time"
 
 	"github.com/Knetic/govaluate"
@@ -76,6 +75,14 @@ func (uc *TriggerTaskUseCase) Execute(ctx context.Context, input dto.TriggerTask
 
 	// 过滤有效任务
 	validTasks := uc.filterValidTasks(tasks)
+	// ========== 风控检查（同步执行，阻塞任务完成）==========
+	for _, task := range validTasks {
+		if err := uc.performRiskCheck(ctx, task.UserID, task.ID); err != nil {
+			fmt.Printf("[TriggerTask] Risk check failed for user %d: %v\n", task.UserID, err)
+			return fmt.Errorf("风控检查失败: %w", err)
+		}
+		fmt.Printf("[TriggerTask] Risk check passed for user %d\n", task.UserID)
+	}
 
 	// 获取表达式参数和函数
 	expressArgs := input.TaskMode.GetExpressionArguments()
@@ -87,10 +94,6 @@ func (uc *TriggerTaskUseCase) Execute(ctx context.Context, input dto.TriggerTask
 		if err := uc.processTask(ctx, task, expressFuncs, expressArgs, input.TaskMode.GetUniqueFlag()); err != nil {
 			fmt.Printf("[TriggerTask] Process task %d failed: %v\n", task.ID, err)
 			lastError = err
-			// 如果是风控检查失败，立即返回错误，不继续处理后续任务
-			if isRiskCheckError(err) {
-				return err
-			}
 			continue
 		}
 	}
@@ -225,13 +228,6 @@ func (uc *TriggerTaskUseCase) processTask(
 
 	fmt.Printf("[TriggerTask] Task %d reached!\n", task.ID)
 
-	// ========== 风控检查（同步执行，阻塞任务完成）==========
-	if err := uc.performRiskCheck(ctx, task.UserID, task.ID); err != nil {
-		fmt.Printf("[TriggerTask] Risk check failed for user %d: %v\n", task.UserID, err)
-		return fmt.Errorf("风控检查失败: %w", err)
-	}
-	fmt.Printf("[TriggerTask] Risk check passed for user %d\n", task.UserID)
-
 	// 创建任务明细
 	detail := &entity.ActUserTaskDetail{
 		TaskID:      task.ID,
@@ -308,18 +304,3 @@ func (uc *TriggerTaskUseCase) performRiskCheck(ctx context.Context, userID, task
 
 	return nil
 }
-
-// isRiskCheckError 判断是否为风控相关的错误
-func isRiskCheckError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errMsg := err.Error()
-	// 检查是否包含风控相关的关键词
-	return strings.Contains(errMsg, "风控检查失败") ||
-		strings.Contains(errMsg, "黑名单") ||
-		strings.Contains(errMsg, "用户行为异常") ||
-		strings.Contains(errMsg, "任务完成频率过高") ||
-		strings.Contains(errMsg, "设备指纹异常")
-}
-
